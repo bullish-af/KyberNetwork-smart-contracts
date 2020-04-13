@@ -10,7 +10,9 @@ import "./utils/PermissionGroupsNoModifiers.sol";
 /**
  *   @title KyberStorage contract
  *   Receives call from KyberNetwork for:
- *   - record contract changes for matchingEngine, feeHandler, reserves and kyberDAO
+ *   - adding / removing reserves
+ *   - listing token pairs for reserves
+ *   - recording contract changes for matchingEngine, feeHandler, reserves, proxies and kyberDAO
  */
 contract KyberStorage is IKyberStorage, PermissionGroupsNoModifiers {
     // store current and previous contracts.

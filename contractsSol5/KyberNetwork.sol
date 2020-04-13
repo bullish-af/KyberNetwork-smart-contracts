@@ -18,12 +18,7 @@ import "./IGasHelper.sol";
 *       KyberDao: to retrieve fee data
 *       KyberFeeHandler: accumulate fees for the trade
 *       KyberMatchingEngine: parse user hint and match reserves.
-*
-*   Kyber network will call matching engine for:
-*       - add / remove reserve
-*       - list tokens
-*       - get rate
-*       - trade.
+*       KyberStorage: store / access reserves, token listings and contract addresses
 */
 
 contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, ReentrancyGuard {
@@ -77,7 +72,7 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
     /// @param minConversionRate The minimal conversion rate. If actual rate is lower, trade reverted.
     /// @param platformWallet Platform wallet address to send platfrom fee.
     /// @param platformFeeBps Percentage of trade to be allocated as platform fee. Ex: 10000 = 100%, 100 = 1%
-    /// @param hint defines which reserves should be used for this trade.
+    /// @param hint user-specified reserves for the trade
     /// @return amount of actual dest tokens in twei
     function tradeWithHintAndFee(
         address payable trader,
@@ -120,7 +115,7 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
     /// @notice can be called only by operator
     /// @dev adds a reserve to/from the network.
     /// @param reserve The reserve address.
-    /// @param reserveId The reserve ID in 8 bytes. 1st byte is reserve type.
+    /// @param reserveId The reserve ID in 32 bytes. 1st byte is reserve type.
     /// @param reserveType Type of the reserve out of enum ReserveType
     /// @param rebateWallet Rebate wallet address for this reserve.
     function addReserve(address reserve, bytes32 reserveId, IKyberMatchingEngine.ReserveType reserveType,
@@ -302,10 +297,10 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
     /// @param dest Destination token
     /// @param srcQty amount of src tokens in twei
     /// @param platformFeeBps Percentage of trade to be allocated as platform fee. Ex: 10000 = 100%, 100 = 1%
-    /// @param hint defines which reserves should be used for this trade
+    /// @param hint user-specified reserves for the trade
     /// @return returns 3 different rates
     /// @param rateWithoutFees rate excluding network and platform fees
-    /// @param rateWithNetworkFee rate excluding network fee, but includes platform fee
+    /// @param rateWithNetworkFee rate excluding platform fee, but includes network fee
     /// @param rateWithAllFees rate after accounting for both network and platform fees
     function getExpectedRateWithHintAndFee(IERC20 src, IERC20 dest, uint srcQty, uint platformFeeBps,
         bytes calldata hint)
@@ -379,9 +374,9 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
     /// @param dest Destination token
     /// @param destAddress Address to send tokens to
     /// @param maxDestAmount Limit amount of dest tokens in twei. if limit is passed, srcAmount will be reduced.
-    /// @param minConversionRate The minimal conversion rate. If actual rate is lower, trade reverted.
+    /// @param minConversionRate The minimal conversion rate. If actual rate is lower, trade reverts.
     /// @param walletId will not be used since no fees are set with this API
-    /// @param hint defines which reserves should be used
+    /// @param hint user-specified reserves for the trade
     function tradeWithHint(address trader, ERC20 src, uint srcAmount, ERC20 dest, address destAddress,
         uint maxDestAmount, uint minConversionRate, address walletId, bytes calldata hint)
         external payable returns(uint destAmount)
@@ -483,6 +478,7 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
     /// @param isFeeAccounted List of reserves requiring users to pay network fee, or not
     /// @param splitsBps List of proportions of trade amount allocated to the reserves
     ///     If there is only 1 reserve, then it should have a value of 10000 bps
+    /// @param srcAmounts List of source amounts when getting rates from, and doing trades with reserves
     /// @param decimals Token decimals. Src decimals when for src -> ETH, dest decimals when ETH -> dest
     struct TradingReserves {
         IKyberReserve[] addresses;
@@ -533,19 +529,18 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
         uint networkFeeBps;
 
         uint numFeeAccountedReserves;
-        uint feeAccountedBps; // what part of this trade is fee paying. for token to token - up to 200%
+        uint feeAccountedBps; // what part of this trade is feeAccounted. for token to token - up to 200%
 
         uint destAmountWithoutFees;
         uint rateWithNetworkFee;
     }
 
     /// @notice
-    /// Calls matching engine that determines all the information necessary for the trade (to be stored in tradeData)
-    /// such as what reserves were selected (their addresses and ids), what rates they offer, fee paying information
-    /// tradeWei amount, network fee wei, platform fee, etc. WITHOUT accounting for maxDestAmount.
+    /// Called by getExpectedRate* and tradeWithHint* functions to get reserves to be traded with,
+    /// srcAmounts, rates, and destAmounts, as well as amount of network and platform fees to be charged
     /// This function should set all TradeData information so that it can be used after without any ambiguity
     /// @param tData main trade data object for trade info to be stored
-    /// @param hint which reserves should be used for the trade
+    /// @param hint user-specified reserves for the trade
     function calcRatesAndAmounts(TradeData memory tData, bytes memory hint)
         internal view returns(uint destAmount, uint rateWithNetworkFee)
     {
@@ -569,6 +564,7 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
         destAmount = calcDestQtyAndMatchReserves(ETH_TOKEN_ADDRESS, tData.input.dest, actualSrcWei,
             tData, tData.ethToToken, hint);
 
+        //re-calculate network fee and actualSrcWei, to account for E2T fee
         tData.networkFeeWei = tData.tradeWei * tData.networkFeeBps / BPS * tData.feeAccountedBps / BPS;
         actualSrcWei = tData.tradeWei - tData.networkFeeWei - tData.platformFeeWei;
 
@@ -585,6 +581,9 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
     }
 
     /// @notice calculate trade data and store them into tData
+    /// Will call matching engine for reserve information (ids, splitsBps, isFeeAccounted), and whether extra
+    /// processing is needed. If necessary, an additional call to matchingEngine is made.
+    /// (Eg. to find the reserve with the best rate), with an update to the stored reserve info subsequently.
     function calcDestQtyAndMatchReserves(
         IERC20 src,
         IERC20 dest,
@@ -973,6 +972,8 @@ contract KyberNetwork is WithdrawableNoModifiers, Utils4, IKyberNetwork, Reentra
     /// @param amount amount of src tokens
     /// @param dest   Destination token
     /// @param destAddress Address to send tokens to
+    /// @param tData main trade data object where trade info is stored
+    /// @param expectedDestAmount twei amount to transfer to destAddress
     /// @return true if trade is successful
     function doReserveTrades(
         IERC20 src,
